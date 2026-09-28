@@ -3,3 +3,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+
+# Ignore DevSpace cache and log folder
+.devspace/

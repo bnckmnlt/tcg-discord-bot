@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
@@ -45,6 +48,9 @@ class GitHubWatchlist:
         self.owner = required_env("GITHUB_OWNER")
         self.repo = required_env("GITHUB_REPO")
         self.branch = os.getenv("GITHUB_BRANCH", "main")
+        self.session = requests.Session()
+        self.session.headers.update(self._headers())
+        self._write_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -58,41 +64,43 @@ class GitHubWatchlist:
         }
 
     def load(self) -> tuple[dict, str]:
-        response = requests.get(
+        response = self.session.get(
             self.url,
-            headers=self._headers(),
             params={"ref": self.branch},
             timeout=20,
         )
         response.raise_for_status()
         payload = response.json()
-        import base64
-
         content = base64.b64decode(payload["content"]).decode("utf-8")
         return json.loads(content), payload["sha"]
 
     def add(self, card: dict) -> int:
-        import base64
+        # GitHub's Contents API uses the file SHA as an optimistic concurrency
+        # check. Serialize writes locally and retry a stale-SHA conflict by
+        # re-reading the file before attempting the update again.
+        with self._write_lock:
+            for attempt in range(2):
+                watchlist, sha = self.load()
+                items = watchlist.setdefault("watchlist", [])
+                items.append(card)
+                content = json.dumps(watchlist, indent=2, ensure_ascii=False) + "\n"
+                encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                response = self.session.put(
+                    self.url,
+                    json={
+                        "message": f"Add watchlist card: {card['name']}",
+                        "content": encoded,
+                        "sha": sha,
+                        "branch": self.branch,
+                    },
+                    timeout=20,
+                )
+                if response.status_code != 409 or attempt == 1:
+                    response.raise_for_status()
+                    return len(items)
 
-        watchlist, sha = self.load()
-        items = watchlist.setdefault("watchlist", [])
-        items.append(card)
-        content = json.dumps(watchlist, indent=2, ensure_ascii=False) + "\n"
-        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        response = requests.put(
-            self.url,
-            headers=self._headers(),
-            params={"branch": self.branch},
-            json={
-                "message": f"Add watchlist card: {card['name']}",
-                "content": encoded,
-                "sha": sha,
-                "branch": self.branch,
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        return len(items)
+                LOG.warning("GitHub watchlist changed concurrently; retrying update")
+            raise RuntimeError("GitHub watchlist update failed after retry")
 
     def list(self) -> list[dict]:
         watchlist, _ = self.load()
@@ -151,8 +159,15 @@ class AddCardModal(discord.ui.Modal, title="Add TCGPlayer Card"):
             await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
             return
 
+        url = self.url.value.strip()
+        try:
+            parse_tcgplayer_url(url)
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
         draft = WatchDraft(
-            url=self.url.value.strip(),
+            url=url,
             name=self.name.value.strip(),
             set_name=self.set_name.value.strip(),
             target_price=target,
@@ -231,9 +246,12 @@ class ConfirmView(discord.ui.View):
 
         try:
             count = await self.bot.github_add(card)
-        except requests.HTTPError as exc:
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
             LOG.exception("GitHub update failed")
-            await interaction.response.edit_message(content=f"❌ GitHub update failed: {exc}", view=None)
+            await interaction.response.edit_message(
+                content=f"❌ GitHub update failed: {exc}",
+                view=None,
+            )
             return
 
         await interaction.response.edit_message(
@@ -265,7 +283,11 @@ class TCGDiscordBot(discord.Client):
             LOG.info("Synced global commands")
 
     async def github_add(self, card: dict) -> int:
-        return self.github.add(card)
+        # requests is synchronous; keep network I/O off Discord's event loop.
+        return await asyncio.to_thread(self.github.add, card)
+
+    async def github_list(self) -> list[dict]:
+        return await asyncio.to_thread(self.github.list)
 
 
 bot = TCGDiscordBot()
@@ -290,8 +312,8 @@ async def list_cards(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("❌ You are not authorized to manage the watchlist.", ephemeral=True)
         return
     try:
-        cards = bot.github.list()
-    except requests.HTTPError as exc:
+        cards = await bot.github_list()
+    except requests.RequestException as exc:
         await interaction.response.send_message(f"❌ GitHub read failed: {exc}", ephemeral=True)
         return
 
@@ -308,7 +330,41 @@ async def list_cards(interaction: discord.Interaction) -> None:
             f"Target ${float(card.get('target_price', 0)):.2f} | Max ${maximum if maximum == '—' else float(maximum):.2f} | Qty {card.get('quantity_needed', 1)} | {card.get('min_condition', 'Any')}"
         )
 
-    await interaction.response.send_message("\n\n".join(lines), ephemeral=True)
+    message = "\n\n".join(lines)
+    # Discord limits a normal message to 2000 characters. Keep the command
+    # useful even when the watchlist grows beyond that size.
+    if len(message) <= 2000:
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    chunks: list[str] = []
+    current = ""
+    for block in lines:
+        candidate = f"{current}\n\n{block}".strip()
+        if len(candidate) > 1900 and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    await interaction.response.send_message(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    LOG.exception("Unhandled application command error", exc_info=error)
+    message = "❌ Something went wrong while processing that command."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.event
@@ -317,5 +373,8 @@ async def on_ready() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-    bot.run(required_env("DISCORD_BOT_TOKEN"))
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    bot.run(required_env("DISCORD_BOT_TOKEN"), log_handler=None)
