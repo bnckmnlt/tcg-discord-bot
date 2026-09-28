@@ -324,10 +324,11 @@ async def list_cards(interaction: discord.Interaction) -> None:
     lines = []
     for index, card in enumerate(cards, 1):
         status = "🟢" if card.get("enabled", True) else "⚪"
-        maximum = card.get("max_price", "—")
+        maximum = card.get("max_price")
+        max_display = "—" if maximum in (None, "", "—") else f"${float(maximum):.2f}"
         lines.append(
             f"{status} **{index}. {card.get('name', 'Unknown')}** — {card.get('set_name', 'Unknown')}\n"
-            f"Target ${float(card.get('target_price', 0)):.2f} | Max ${maximum if maximum == '—' else float(maximum):.2f} | Qty {card.get('quantity_needed', 1)} | {card.get('min_condition', 'Any')}"
+            f"Target ${float(card.get('target_price', 0)):.2f} | Max {max_display} | Qty {card.get('quantity_needed', 1)} | {card.get('min_condition', 'Any')}"
         )
 
     message = "\n\n".join(lines)
