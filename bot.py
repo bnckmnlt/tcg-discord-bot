@@ -96,6 +96,12 @@ class GitHubWatchlist:
                     timeout=20,
                 )
                 if response.status_code != 409 or attempt == 1:
+                    if response.status_code == 403:
+                        try:
+                            details = response.json().get("message", response.text)
+                        except ValueError:
+                            details = response.text
+                        raise RuntimeError(f"GitHub permission denied: {details}")
                     response.raise_for_status()
                     return len(items)
 
@@ -184,7 +190,7 @@ class AddCardModal(discord.ui.Modal, title="Add TCGPlayer Card"):
             printing="",
         )
         await interaction.response.send_message(
-            "Choose the remaining watch settings:",
+            "Choose the minimum condition:",
             view=WatchSettingsView(self.bot, draft),
             ephemeral=True,
         )
@@ -207,22 +213,8 @@ class WatchSettingsView(discord.ui.View):
     )
     async def condition(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
         self.draft.min_condition = "" if select.values[0] == "Any" else select.values[0]
-        await interaction.response.edit_message(content="Condition saved. Now choose quantity.", view=QuantityView(self.bot, self.draft))
-
-
-class QuantityView(discord.ui.View):
-    def __init__(self, bot: "TCGDiscordBot", draft: WatchDraft) -> None:
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.draft = draft
-
-    @discord.ui.select(
-        placeholder="Quantity needed",
-        options=[discord.SelectOption(label=str(i), value=str(i)) for i in range(1, 6)],
-    )
-    async def quantity(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
-        self.draft.quantity_needed = int(select.values[0])
-        await interaction.response.edit_message(content="Quantity saved. Review your watch:", view=ConfirmView(self.bot, self.draft))
+        self.draft.quantity_needed = 1
+        await interaction.response.edit_message(content="Condition saved. Review your watch:", view=ConfirmView(self.bot, self.draft))
 
 
 class ConfirmView(discord.ui.View):
