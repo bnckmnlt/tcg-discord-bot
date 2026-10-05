@@ -362,14 +362,191 @@ class EditConditionView(discord.ui.View):
             discord.SelectOption(label="Near Mint", value="Near Mint"),
             discord.SelectOption(label="Lightly Played", value="Lightly Played"),
             discord.SelectOption(label="Moderately Played", value="Moderately Played"),
-            discord.SelectOption(label="Any", value="Any"),
+            discord.SelectOption(label="Any / no minimum", value="Any"),
         ],
     )
     async def condition(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
         self.card["min_condition"] = "" if select.values[0] == "Any" else select.values[0]
-        await interaction.response.edit_message(
-            content="Condition saved. Review your changes:",
+        await interaction.response.send_modal(
+            EditAdvancedModal(self.bot, self.index, self.card)
+        )
+
+
+class EditAdvancedModal(discord.ui.Modal, title="Edit Card — Additional Settings"):
+    quantity = discord.ui.TextInput(
+        label="Quantity needed",
+        placeholder="1",
+        required=False,
+    )
+    language = discord.ui.TextInput(
+        label="Language",
+        placeholder="English (blank = default)",
+        required=False,
+    )
+    printing = discord.ui.TextInput(
+        label="Printing",
+        placeholder="Holofoil, Reverse Holo, etc. (optional)",
+        required=False,
+    )
+    price_drop = discord.ui.TextInput(
+        label="Price-drop alert %",
+        placeholder="10 (blank = use default)",
+        required=False,
+    )
+    score_threshold = discord.ui.TextInput(
+        label="Deal-score threshold",
+        placeholder="70 (blank = use default)",
+        required=False,
+    )
+
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict) -> None:
+        super().__init__()
+        self.bot = bot
+        self.index = index
+        self.card = card
+        self.quantity.default = str(card.get("quantity_needed", ""))
+        self.language.default = str(card.get("language", ""))
+        self.printing.default = str(card.get("printing", ""))
+        self.price_drop.default = str(card.get("price_drop_percent", ""))
+        self.score_threshold.default = str(card.get("deal_score_threshold", ""))
+
+    @staticmethod
+    def _optional_number(value: str, label: str, minimum: float = 0) -> float | None:
+        value = value.strip()
+        if not value:
+            return None
+        parsed = float(value)
+        if parsed < minimum:
+            raise ValueError(f"{label} must be at least {minimum:g}.")
+        return parsed
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            quantity = self.quantity.value.strip()
+            if quantity:
+                quantity_value = int(quantity)
+                if quantity_value < 1:
+                    raise ValueError("Quantity needed must be at least 1.")
+                self.card["quantity_needed"] = quantity_value
+            else:
+                self.card.pop("quantity_needed", None)
+
+            language = self.language.value.strip()
+            if language:
+                self.card["language"] = language
+            else:
+                self.card.pop("language", None)
+
+            printing = self.printing.value.strip()
+            if printing:
+                self.card["printing"] = printing
+            else:
+                self.card.pop("printing", None)
+
+            price_drop = self._optional_number(self.price_drop.value, "Price-drop alert %")
+            if price_drop is None:
+                self.card.pop("price_drop_percent", None)
+            else:
+                self.card["price_drop_percent"] = price_drop
+
+            score_threshold = self._optional_number(self.score_threshold.value, "Deal-score threshold")
+            if score_threshold is None:
+                self.card.pop("deal_score_threshold", None)
+            else:
+                self.card["deal_score_threshold"] = score_threshold
+        except (ValueError, TypeError) as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(
+            EditTriggerModal(self.bot, self.index, self.card)
+        )
+
+
+class EditTriggerModal(discord.ui.Modal, title="Edit Card — Deal Triggers"):
+    min_savings = discord.ui.TextInput(
+        label="Minimum savings (USD)",
+        placeholder="Blank = disabled",
+        required=False,
+    )
+    min_discount = discord.ui.TextInput(
+        label="Minimum discount %",
+        placeholder="Blank = disabled",
+        required=False,
+    )
+    history_days = discord.ui.TextInput(
+        label="History window (days)",
+        placeholder="7 (blank = use default)",
+        required=False,
+    )
+    history_discount = discord.ui.TextInput(
+        label="Historical discount %",
+        placeholder="Blank = disabled",
+        required=False,
+    )
+    tags = discord.ui.TextInput(
+        label="Tags",
+        placeholder="discord, vintage (comma-separated, optional)",
+        required=False,
+    )
+
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict) -> None:
+        super().__init__()
+        self.bot = bot
+        self.index = index
+        self.card = card
+        self.min_savings.default = str(card.get("min_savings", ""))
+        self.min_discount.default = str(card.get("min_discount_percent", ""))
+        self.history_days.default = str(card.get("history_days", ""))
+        self.history_discount.default = str(card.get("history_discount_percent", ""))
+        self.tags.default = ", ".join(str(tag) for tag in card.get("tags", []))
+
+    @staticmethod
+    def _optional_number(value: str, label: str, minimum: float = 0) -> float | None:
+        value = value.strip()
+        if not value:
+            return None
+        parsed = float(value)
+        if parsed < minimum:
+            raise ValueError(f"{label} must be at least {minimum:g}.")
+        return parsed
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            fields = (
+                ("min_savings", self.min_savings.value, "Minimum savings"),
+                ("min_discount_percent", self.min_discount.value, "Minimum discount %"),
+                ("history_discount_percent", self.history_discount.value, "Historical discount %"),
+            )
+            for key, raw, label in fields:
+                value = self._optional_number(raw, label)
+                if value is None:
+                    self.card.pop(key, None)
+                else:
+                    self.card[key] = value
+
+            history_days = self.history_days.value.strip()
+            if history_days:
+                history_days_value = int(history_days)
+                if history_days_value < 1:
+                    raise ValueError("History window must be at least 1 day.")
+                self.card["history_days"] = history_days_value
+            else:
+                self.card.pop("history_days", None)
+
+            tags = [tag.strip() for tag in self.tags.value.split(",") if tag.strip()]
+            if tags:
+                self.card["tags"] = tags
+            else:
+                self.card.pop("tags", None)
+        except (ValueError, TypeError) as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "All editable fields saved locally. Review the complete change before committing:",
             view=EditConfirmView(self.bot, self.index, self.card),
+            ephemeral=True,
         )
 
 
@@ -417,6 +594,36 @@ class RemoveConfirmView(discord.ui.View):
 
         await interaction.response.edit_message(
             content=f"✅ Removed **{removed.get('name', self.card.get('name', 'Unknown'))}**.\nWatchlist now has **{count}** cards.",
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+class ToggleCardView(discord.ui.View):
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict, enabled: bool) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.index = index
+        self.card = card
+        self.enabled = enabled
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        updated = dict(self.card)
+        updated["enabled"] = self.enabled
+        try:
+            _, count = await self.bot.github_update(self.index, updated)
+        except (requests.RequestException, ValueError, RuntimeError, IndexError) as exc:
+            LOG.exception("GitHub update failed")
+            await interaction.response.edit_message(content=f"❌ GitHub update failed: {exc}", view=None)
+            return
+
+        state = "resumed" if self.enabled else "paused"
+        await interaction.response.edit_message(
+            content=f"✅ **{updated.get('name', 'Unknown')}** is now **{state}**.\nWatchlist still has **{count}** cards.",
             view=None,
         )
 
@@ -474,6 +681,12 @@ class CardPickerView(discord.ui.View):
         card = self.cards[index]
         if self.mode == "edit":
             await interaction.response.send_modal(EditCardModal(self.bot, index, card))
+        elif self.mode in {"pause", "resume"}:
+            enabled = self.mode == "resume"
+            await interaction.response.edit_message(
+                content=f"{'Resume' if enabled else 'Pause'} **{card.get('name', 'Unknown')}** — {card.get('set_name', 'Unknown')}?",
+                view=ToggleCardView(self.bot, index, card, enabled),
+            )
         else:
             await interaction.response.edit_message(
                 content=f"Remove **{card.get('name', 'Unknown')}** — {card.get('set_name', 'Unknown')}?",
@@ -582,6 +795,38 @@ async def edit_card(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         "Select the card to edit:",
         view=CardPickerView(bot, cards, "edit"),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="pause-card", description="Pause alerts for a TCGPlayer watchlist card")
+async def pause_card(interaction: discord.Interaction) -> None:
+    await toggle_card(interaction, "pause")
+
+
+@bot.tree.command(name="resume-card", description="Resume alerts for a TCGPlayer watchlist card")
+async def resume_card(interaction: discord.Interaction) -> None:
+    await toggle_card(interaction, "resume")
+
+
+async def toggle_card(interaction: discord.Interaction, mode: str) -> None:
+    if not authorized(interaction):
+        await interaction.response.send_message("❌ You are not authorized to manage the watchlist.", ephemeral=True)
+        return
+    try:
+        cards = await bot.github_list()
+    except requests.RequestException as exc:
+        await interaction.response.send_message(f"❌ GitHub read failed: {exc}", ephemeral=True)
+        return
+
+    if not cards:
+        await interaction.response.send_message("The watchlist is empty.", ephemeral=True)
+        return
+
+    action = "pause" if mode == "pause" else "resume"
+    await interaction.response.send_message(
+        f"Select the card to {action}:",
+        view=CardPickerView(bot, cards, mode),
         ephemeral=True,
     )
 
