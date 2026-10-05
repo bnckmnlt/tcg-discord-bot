@@ -74,38 +74,75 @@ class GitHubWatchlist:
         content = base64.b64decode(payload["content"]).decode("utf-8")
         return json.loads(content), payload["sha"]
 
+    def _save(self, watchlist: dict, sha: str, message: str) -> None:
+        content = json.dumps(watchlist, indent=2, ensure_ascii=False) + "\n"
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        response = self.session.put(
+            self.url,
+            json={
+                "message": message,
+                "content": encoded,
+                "sha": sha,
+                "branch": self.branch,
+            },
+            timeout=20,
+        )
+        if response.status_code == 403:
+            try:
+                details = response.json().get("message", response.text)
+            except ValueError:
+                details = response.text
+            raise RuntimeError(f"GitHub permission denied: {details}")
+        response.raise_for_status()
+
     def add(self, card: dict) -> int:
-        # GitHub's Contents API uses the file SHA as an optimistic concurrency
-        # check. Serialize writes locally and retry a stale-SHA conflict by
-        # re-reading the file before attempting the update again.
         with self._write_lock:
             for attempt in range(2):
                 watchlist, sha = self.load()
                 items = watchlist.setdefault("watchlist", [])
                 items.append(card)
-                content = json.dumps(watchlist, indent=2, ensure_ascii=False) + "\n"
-                encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-                response = self.session.put(
-                    self.url,
-                    json={
-                        "message": f"Add watchlist card: {card['name']}",
-                        "content": encoded,
-                        "sha": sha,
-                        "branch": self.branch,
-                    },
-                    timeout=20,
-                )
-                if response.status_code != 409 or attempt == 1:
-                    if response.status_code == 403:
-                        try:
-                            details = response.json().get("message", response.text)
-                        except ValueError:
-                            details = response.text
-                        raise RuntimeError(f"GitHub permission denied: {details}")
-                    response.raise_for_status()
+                try:
+                    self._save(watchlist, sha, f"Add watchlist card: {card['name']}")
                     return len(items)
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 409 or attempt == 1:
+                        raise
+                    LOG.warning("GitHub watchlist changed concurrently; retrying update")
+            raise RuntimeError("GitHub watchlist update failed after retry")
 
-                LOG.warning("GitHub watchlist changed concurrently; retrying update")
+    def remove(self, index: int) -> tuple[dict, int]:
+        with self._write_lock:
+            for attempt in range(2):
+                watchlist, sha = self.load()
+                items = watchlist.setdefault("watchlist", [])
+                if index < 0 or index >= len(items):
+                    raise IndexError("That watchlist card no longer exists.")
+                removed = items.pop(index)
+                try:
+                    self._save(watchlist, sha, f"Remove watchlist card: {removed.get('name', 'Unknown')}")
+                    return removed, len(items)
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 409 or attempt == 1:
+                        raise
+                    LOG.warning("GitHub watchlist changed concurrently; retrying update")
+            raise RuntimeError("GitHub watchlist update failed after retry")
+
+    def update(self, index: int, card: dict) -> tuple[dict, int]:
+        with self._write_lock:
+            for attempt in range(2):
+                watchlist, sha = self.load()
+                items = watchlist.setdefault("watchlist", [])
+                if index < 0 or index >= len(items):
+                    raise IndexError("That watchlist card no longer exists.")
+                previous = items[index]
+                items[index] = card
+                try:
+                    self._save(watchlist, sha, f"Edit watchlist card: {card.get('name', 'Unknown')}")
+                    return previous, len(items)
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 409 or attempt == 1:
+                        raise
+                    LOG.warning("GitHub watchlist changed concurrently; retrying update")
             raise RuntimeError("GitHub watchlist update failed after retry")
 
     def list(self) -> list[dict]:
@@ -262,6 +299,201 @@ class ConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled.", view=None)
 
 
+class EditCardModal(discord.ui.Modal, title="Edit TCGPlayer Card"):
+    name = discord.ui.TextInput(label="Card name", required=True)
+    set_name = discord.ui.TextInput(label="Set name", required=True)
+    target = discord.ui.TextInput(label="Target price (USD)", required=True)
+    maximum = discord.ui.TextInput(label="Max landed price (USD)", placeholder="Leave blank for no limit", required=False)
+    url = discord.ui.TextInput(label="TCGPlayer URL", required=True)
+
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict) -> None:
+        super().__init__()
+        self.bot = bot
+        self.index = index
+        self.original = card
+        self.name.default = str(card.get("name", ""))
+        self.set_name.default = str(card.get("set_name", ""))
+        self.target.default = str(card.get("target_price", ""))
+        self.maximum.default = "" if card.get("max_price") in (None, "") else str(card.get("max_price"))
+        self.url.default = str(card.get("url", ""))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            target = float(self.target.value)
+            maximum = float(self.maximum.value) if self.maximum.value.strip() else None
+            if target < 0 or (maximum is not None and maximum < 0):
+                raise ValueError("Prices cannot be negative.")
+            if maximum is not None and maximum < target:
+                raise ValueError("Max landed price cannot be lower than the target price.")
+            parse_tcgplayer_url(self.url.value.strip())
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        draft = dict(self.original)
+        draft.update({
+            "name": self.name.value.strip(),
+            "set_name": self.set_name.value.strip(),
+            "target_price": target,
+            "url": self.url.value.strip(),
+        })
+        if maximum is None:
+            draft.pop("max_price", None)
+        else:
+            draft["max_price"] = maximum
+
+        await interaction.response.send_message(
+            "Choose the minimum condition:",
+            view=EditConditionView(self.bot, self.index, draft),
+            ephemeral=True,
+        )
+
+
+class EditConditionView(discord.ui.View):
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.index = index
+        self.card = card
+
+    @discord.ui.select(
+        placeholder="Minimum condition",
+        options=[
+            discord.SelectOption(label="Near Mint", value="Near Mint"),
+            discord.SelectOption(label="Lightly Played", value="Lightly Played"),
+            discord.SelectOption(label="Moderately Played", value="Moderately Played"),
+            discord.SelectOption(label="Any", value="Any"),
+        ],
+    )
+    async def condition(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
+        self.card["min_condition"] = "" if select.values[0] == "Any" else select.values[0]
+        await interaction.response.edit_message(
+            content="Condition saved. Review your changes:",
+            view=EditConfirmView(self.bot, self.index, self.card),
+        )
+
+
+class EditConfirmView(discord.ui.View):
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.index = index
+        self.card = card
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        try:
+            _, count = await self.bot.github_update(self.index, self.card)
+        except (requests.RequestException, ValueError, RuntimeError, IndexError) as exc:
+            LOG.exception("GitHub update failed")
+            await interaction.response.edit_message(content=f"❌ GitHub update failed: {exc}", view=None)
+            return
+
+        await interaction.response.edit_message(
+            content=f"✅ Updated **{self.card.get('name', 'Unknown')}**.\nWatchlist still has **{count}** cards.",
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+class RemoveConfirmView(discord.ui.View):
+    def __init__(self, bot: "TCGDiscordBot", index: int, card: dict) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.index = index
+        self.card = card
+
+    @discord.ui.button(label="Remove", style=discord.ButtonStyle.danger)
+    async def remove(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        try:
+            removed, count = await self.bot.github_remove(self.index)
+        except (requests.RequestException, ValueError, RuntimeError, IndexError) as exc:
+            LOG.exception("GitHub update failed")
+            await interaction.response.edit_message(content=f"❌ GitHub update failed: {exc}", view=None)
+            return
+
+        await interaction.response.edit_message(
+            content=f"✅ Removed **{removed.get('name', self.card.get('name', 'Unknown'))}**.\nWatchlist now has **{count}** cards.",
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+class CardPickerView(discord.ui.View):
+    PAGE_SIZE = 25
+
+    def __init__(self, bot: "TCGDiscordBot", cards: list[dict], mode: str) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.cards = cards
+        self.mode = mode
+        self.page = 0
+        self._refresh()
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (len(self.cards) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def _refresh(self) -> None:
+        self.clear_items()
+        start = self.page * self.PAGE_SIZE
+        current = self.cards[start:start + self.PAGE_SIZE]
+        options = []
+        for offset, card in enumerate(current):
+            index = start + offset
+            label = str(card.get("name", "Unknown"))[:100]
+            description = str(card.get("set_name", "Unknown"))[:100]
+            options.append(discord.SelectOption(label=label or "Unknown", description=description or None, value=str(index)))
+
+        select = discord.ui.Select(
+            placeholder="Select a card",
+            options=options,
+        )
+        select.callback = self._selected
+        self.add_item(select)
+
+        previous = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary, disabled=self.page == 0)
+        previous.callback = self._previous
+        self.add_item(previous)
+        next_button = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary, disabled=self.page >= self.page_count - 1)
+        next_button.callback = self._next
+        self.add_item(next_button)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    async def _selected(self, interaction: discord.Interaction) -> None:
+        select = interaction.data
+        index = int(select["values"][0])
+        card = self.cards[index]
+        if self.mode == "edit":
+            await interaction.response.send_modal(EditCardModal(self.bot, index, card))
+        else:
+            await interaction.response.edit_message(
+                content=f"Remove **{card.get('name', 'Unknown')}** — {card.get('set_name', 'Unknown')}?",
+                view=RemoveConfirmView(self.bot, index, card),
+            )
+
+    async def _previous(self, interaction: discord.Interaction) -> None:
+        self.page -= 1
+        self._refresh()
+        await interaction.response.edit_message(view=self)
+
+    async def _next(self, interaction: discord.Interaction) -> None:
+        self.page += 1
+        self._refresh()
+        await interaction.response.edit_message(view=self)
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
 class TCGDiscordBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.none()
@@ -287,6 +519,12 @@ class TCGDiscordBot(discord.Client):
     async def github_list(self) -> list[dict]:
         return await asyncio.to_thread(self.github.list)
 
+    async def github_remove(self, index: int) -> tuple[dict, int]:
+        return await asyncio.to_thread(self.github.remove, index)
+
+    async def github_update(self, index: int, card: dict) -> tuple[dict, int]:
+        return await asyncio.to_thread(self.github.update, index, card)
+
 
 bot = TCGDiscordBot()
 
@@ -302,6 +540,50 @@ async def add_card(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("❌ You are not authorized to manage the watchlist.", ephemeral=True)
         return
     await interaction.response.send_modal(AddCardModal(bot))
+
+
+@bot.tree.command(name="remove-card", description="Remove a card from the TCGPlayer watchlist")
+async def remove_card(interaction: discord.Interaction) -> None:
+    if not authorized(interaction):
+        await interaction.response.send_message("❌ You are not authorized to manage the watchlist.", ephemeral=True)
+        return
+    try:
+        cards = await bot.github_list()
+    except requests.RequestException as exc:
+        await interaction.response.send_message(f"❌ GitHub read failed: {exc}", ephemeral=True)
+        return
+
+    if not cards:
+        await interaction.response.send_message("The watchlist is empty.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "Select the card to remove:",
+        view=CardPickerView(bot, cards, "remove"),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="edit-card", description="Edit a card on the TCGPlayer watchlist")
+async def edit_card(interaction: discord.Interaction) -> None:
+    if not authorized(interaction):
+        await interaction.response.send_message("❌ You are not authorized to manage the watchlist.", ephemeral=True)
+        return
+    try:
+        cards = await bot.github_list()
+    except requests.RequestException as exc:
+        await interaction.response.send_message(f"❌ GitHub read failed: {exc}", ephemeral=True)
+        return
+
+    if not cards:
+        await interaction.response.send_message("The watchlist is empty.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "Select the card to edit:",
+        view=CardPickerView(bot, cards, "edit"),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="list-cards", description="Show cards currently on the TCGPlayer watchlist")

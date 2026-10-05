@@ -5,8 +5,10 @@ A small Discord bot for managing the TCGPlayer Alert Bot watchlist.
 ## What it does
 
 - `/add-card` opens an interactive setup flow.
+- `/edit-card` lets you select and update an existing card's name, set, prices, URL, and minimum condition.
+- `/remove-card` lets you select a card and remove it after confirmation.
 - `/list-cards` reads the current watchlist from GitHub.
-- Confirming a card updates `data/watchlist.json` in the `tcg-alert-bot` repository through the GitHub API.
+- Add, edit, and remove actions update `data/watchlist.json` in the `tcg-alert-bot` repository through the GitHub API.
 - The existing GitHub Actions scraper then uses the updated watchlist on its next run.
 
 ## Railway configuration
