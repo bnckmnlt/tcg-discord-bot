@@ -200,11 +200,11 @@ class WatchSettingsView(discord.ui.View):
             discord.SelectOption(label="Near Mint", value="Near Mint"),
             discord.SelectOption(label="Lightly Played", value="Lightly Played"),
             discord.SelectOption(label="Moderately Played", value="Moderately Played"),
-            discord.SelectOption(label="Any", value=""),
+            discord.SelectOption(label="Any", value="Any"),
         ],
     )
     async def condition(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
-        self.draft.min_condition = select.values[0]
+        self.draft.min_condition = "" if select.values[0] == "Any" else select.values[0]
         await interaction.response.edit_message(content="Condition saved. Now choose quantity.", view=QuantityView(self.bot, self.draft))
 
 
