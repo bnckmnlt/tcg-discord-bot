@@ -108,19 +108,23 @@ class GitHubWatchlist:
 
 
 def parse_tcgplayer_url(url: str) -> dict[str, str]:
+    # Accept normal TCGPlayer product URLs, including their query parameters
+    # (Printing, Condition, Language, page, etc.).
+    url = url.strip().strip("<>")
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or "tcgplayer.com" not in parsed.netloc.lower():
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or hostname not in {"tcgplayer.com", "www.tcgplayer.com"}:
         raise ValueError("Please provide a valid TCGPlayer URL.")
 
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 3 or parts[0].lower() != "product":
+    if len(parts) < 3 or parts[0].lower() != "product" or not parts[1].isdigit():
         raise ValueError("That does not look like a TCGPlayer product URL.")
 
     slug = parts[2]
     query = parse_qs(parsed.query)
     language = query.get("Language", ["English"])[0]
-    condition = query.get("Condition", ["Near Mint"])[0].replace("+", " ")
-    printing = query.get("Printing", [""])[0].replace("+", " ")
+    condition = query.get("Condition", ["Near Mint"])[0]
+    printing = query.get("Printing", [""])[0]
 
     # TCGPlayer slugs commonly contain the set and card name. We keep this
     # conservative: the user can review/edit the extracted values before saving.
