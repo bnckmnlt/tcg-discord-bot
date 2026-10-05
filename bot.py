@@ -116,11 +116,13 @@ def parse_tcgplayer_url(url: str) -> dict[str, str]:
     if parsed.scheme not in {"http", "https"} or hostname not in {"tcgplayer.com", "www.tcgplayer.com"}:
         raise ValueError("Please provide a valid TCGPlayer URL.")
 
+    # The product ID is the only required path component. TCGPlayer can
+    # change the slug format, so don't make the validator depend on it.
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 3 or parts[0].lower() != "product" or not parts[1].isdigit():
+    if len(parts) < 2 or parts[0].lower() != "product" or not parts[1].isdigit():
         raise ValueError("That does not look like a TCGPlayer product URL.")
 
-    slug = parts[2]
+    slug = parts[2] if len(parts) >= 3 else parts[1]
     query = parse_qs(parsed.query)
     language = query.get("Language", ["English"])[0]
     condition = query.get("Condition", ["Near Mint"])[0]
